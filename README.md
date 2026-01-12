@@ -124,7 +124,7 @@ A scalable, production-ready agentic system for banking chatbot applications wit
 1. **Clone the repository**
    ```bash
    git clone <repository-url>
-   cd ai_rag_app
+   cd ai-platform
    ```
 
 2. **Create virtual environment**
@@ -418,7 +418,7 @@ See `examples/` directory for:
 ### Project Structure
 
 ```
-ai_rag_app/
+ai-platform/
 ├── app.py                          # FastAPI application entry point
 ├── settings.py                     # Configuration
 ├── requirements.txt                # Python dependencies
