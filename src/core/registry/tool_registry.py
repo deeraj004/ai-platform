@@ -36,6 +36,7 @@ class ToolRegistry:
     def __init__(self, persistence_file: Optional[str] = None):
         self._domain_tools: Dict[str, List[BaseTool]] = {}
         self._tool_metadata: Dict[str, Dict[str, Any]] = {}
+        self._tool_name_mapping: Dict[str, str] = {}  # Maps truncated names to original names
         
         # Set persistence file path
         if persistence_file is None:
@@ -160,8 +161,8 @@ class ToolRegistry:
                     if oauth2_token:
                         headers["Authorization"] = f"Bearer {oauth2_token}"
                     else:
-                        headers["Authorization"] = f"Bearer A21AALMiDcIh5KMbcvqHU0X1g0hhQzhfEOIeyKFxWhvbaUeDbRWIqcYJqiSCX3guH1Hys_Y4yeBLcaEo8VMT6MeSfx8klCeDA"
-                elif auth_token:
+                        return {"error": "Failed to obtain OAuth2 access token", "status": "auth_error"}
+                elif auth_token:    
                     headers["Authorization"] = f"Bearer {auth_token}"
                 
                 # Make request
@@ -361,13 +362,43 @@ class ToolRegistry:
                 # Call parent's _parse_input
                 return super()._parse_input(tool_input, tool_call_id)
         
+        # Truncate tool name to 64 characters (Azure OpenAI limit)
+        # Keep original name in metadata for reference
+        max_name_length = 64
+        if len(tool_name) > max_name_length:
+            # Truncate but try to preserve meaningful parts
+            # If it's domain.api_name format, try to keep domain and truncate api_name
+            if '.' in tool_name:
+                domain_part, api_part = tool_name.split('.', 1)
+                # Reserve space for domain + dot + some of api_name
+                available_for_api = max_name_length - len(domain_part) - 1
+                if available_for_api > 0:
+                    truncated_name = f"{domain_part}.{api_part[:available_for_api]}"
+                else:
+                    truncated_name = tool_name[:max_name_length]
+            else:
+                truncated_name = tool_name[:max_name_length]
+            
+            logger.warning(
+                f"Tool name '{tool_name}' ({len(tool_name)} chars) exceeds Azure OpenAI limit of {max_name_length} chars. "
+                f"Truncated to '{truncated_name}' ({len(truncated_name)} chars)"
+            )
+            # Store mapping from truncated name to original name
+            self._tool_name_mapping[truncated_name] = tool_name
+            tool_name_for_llm = truncated_name
+        else:
+            tool_name_for_llm = tool_name
+        
         # Create LangChain tool using custom BankingAPITool
         langchain_tool = BankingAPITool.from_function(
             func=api_function,
-            name=tool_name,
+            name=tool_name_for_llm,  # Use truncated name for LLM
             description=description,
             args_schema=args_schema
         )
+        
+        # Store original name in tool metadata for reference
+        langchain_tool._original_name = tool_name
         
         # Register tool
         tool_type = "banking_api"
@@ -509,8 +540,31 @@ class ToolRegistry:
                     temp_url = spec.url.replace("{{base_url}}", "__BASE_URL_PLACEHOLDER__")
                     path_params = re.findall(r'\{(\w+)\}', temp_url)
                     
+                    # Truncate tool name to 64 characters (Azure OpenAI limit)
+                    max_name_length = 64
+                    if len(tool_name) > max_name_length:
+                        # Truncate but try to preserve meaningful parts
+                        if '.' in tool_name:
+                            domain_part, api_part = tool_name.split('.', 1)
+                            available_for_api = max_name_length - len(domain_part) - 1
+                            if available_for_api > 0:
+                                tool_name_for_llm = f"{domain_part}.{api_part[:available_for_api]}"
+                            else:
+                                tool_name_for_llm = tool_name[:max_name_length]
+                        else:
+                            tool_name_for_llm = tool_name[:max_name_length]
+                        
+                        logger.warning(
+                            f"Loaded tool '{tool_name}' ({len(tool_name)} chars) exceeds Azure OpenAI limit. "
+                            f"Using truncated name '{tool_name_for_llm}' ({len(tool_name_for_llm)} chars)"
+                        )
+                        # Store mapping from truncated name to original name
+                        self._tool_name_mapping[tool_name_for_llm] = tool_name
+                    else:
+                        tool_name_for_llm = tool_name
+                    
                     api_function = self._create_api_function(
-                        tool_name,
+                        tool_name,  # Use original name for function
                         metadata.get("description", ""),
                         spec,
                         auth_token=None,
@@ -520,10 +574,12 @@ class ToolRegistry:
                     args_schema = self._build_args_schema(spec.request_schema, path_params=path_params)
                     langchain_tool = StructuredTool.from_function(
                         func=api_function,
-                        name=tool_name,
+                        name=tool_name_for_llm,  # Use truncated name for LLM
                         description=metadata.get("description", ""),
                         args_schema=args_schema
                     )
+                    # Store original name
+                    langchain_tool._original_name = tool_name
                     
                     # Register without saving (to avoid recursion)
                     self.register_tool(domain, langchain_tool, metadata, save_to_file=False)
