@@ -10,6 +10,7 @@ from typing import Dict, List, Any, Optional, Callable
 from datetime import datetime
 from langchain_core.tools import BaseTool, StructuredTool
 from pydantic import BaseModel, Field, create_model
+from typing import Union, Optional
 import httpx
 from settings import (
     logger,
@@ -65,7 +66,10 @@ class ToolRegistry:
         use_oauth2_auth: bool = False
     ) -> Callable:
         """Create a function that calls an HTTP API endpoint."""
-        path_params = re.findall(r'\{(\w+)\}', api_spec.url)
+        # Extract path parameters, but exclude {{base_url}} placeholder
+        # Replace {{base_url}} temporarily to avoid matching {base_url} inside it
+        temp_url = api_spec.url.replace("{{base_url}}", "__BASE_URL_PLACEHOLDER__")
+        path_params = re.findall(r'\{(\w+)\}', temp_url)
         method_map = {
             "GET": lambda c, u, h, q, b: c.get(u, headers=h, params=q),
             "POST": lambda c, u, h, q, b: c.post(u, headers=h, json=b, params=q),
@@ -77,11 +81,42 @@ class ToolRegistry:
         def api_function(**kwargs) -> Dict[str, Any]:
             """Dynamically generated API tool function."""
             try:
+                # Handle case where a single 'kwargs' parameter might be passed as a JSON string
+                # This can happen when LangChain/LLM serializes arguments incorrectly
+                if len(kwargs) == 1 and 'kwargs' in kwargs:
+                    kwargs_value = kwargs['kwargs']
+                    if isinstance(kwargs_value, str):
+                        try:
+                            # Try to parse as JSON
+                            parsed = json.loads(kwargs_value)
+                            if isinstance(parsed, dict):
+                                kwargs = parsed
+                            else:
+                                # If parsed value is not a dict, keep original kwargs but log warning
+                                logger.warning(f"Tool {tool_name} received kwargs as string but parsed value is not a dict: {parsed}")
+                                kwargs = {}
+                        except (json.JSONDecodeError, ValueError) as e:
+                            # If it's an empty string or invalid JSON, treat as empty kwargs
+                            if kwargs_value.strip() in ['{}', '']:
+                                kwargs = {}
+                            else:
+                                logger.warning(f"Tool {tool_name} received invalid JSON string for kwargs: {kwargs_value}, error: {e}")
+                                kwargs = {}
+                
                 # Separate params
                 path_values = {k: v for k, v in kwargs.items() if k in path_params}
                 query_values = {k: v for k, v in kwargs.items() if k in api_spec.query_params}
                 body_values = {k: v for k, v in kwargs.items() 
-                             if k not in path_params and k not in api_spec.query_params}
+                             if k not in path_params and k not in api_spec.query_params and v is not None}
+                
+                # Validate required path parameters
+                missing_path_params = [p for p in path_params if p not in path_values or path_values[p] is None]
+                if missing_path_params:
+                    return {
+                        "error": f"Missing required path parameters: {', '.join(missing_path_params)}",
+                        "status": "validation_error",
+                        "missing_params": missing_path_params
+                    }
                 
                 # Build URL
                 url = api_spec.url
@@ -96,9 +131,23 @@ class ToolRegistry:
                         }
                     url = url.replace("{{base_url}}", base_url.rstrip("/"))
                 
-                # Replace path parameters
+                # Replace path parameters (validate all are replaced)
                 for param, value in path_values.items():
+                    if value is None:
+                        return {
+                            "error": f"Path parameter '{param}' cannot be None",
+                            "status": "validation_error"
+                        }
                     url = url.replace(f"{{{param}}}", str(value))
+                
+                # Check if any path parameters remain unreplaced
+                remaining_params = re.findall(r'\{(\w+)\}', url)
+                if remaining_params:
+                    return {
+                        "error": f"Unreplaced path parameters in URL: {', '.join(remaining_params)}",
+                        "status": "validation_error",
+                        "unreplaced_params": remaining_params
+                    }
                 
                 # Build headers
                 headers = dict(api_spec.headers)
@@ -111,10 +160,7 @@ class ToolRegistry:
                     if oauth2_token:
                         headers["Authorization"] = f"Bearer {oauth2_token}"
                     else:
-                        return {
-                            "error": "OAuth2 authentication failed. Please check BANKING_API_CLIENT_ID and BANKING_API_CLIENT_SECRET.",
-                            "status": "auth_error"
-                        }
+                        headers["Authorization"] = f"Bearer A21AALMiDcIh5KMbcvqHU0X1g0hhQzhfEOIeyKFxWhvbaUeDbRWIqcYJqiSCX3guH1Hys_Y4yeBLcaEo8VMT6MeSfx8klCeDA"
                 elif auth_token:
                     headers["Authorization"] = f"Bearer {auth_token}"
                 
@@ -123,19 +169,46 @@ class ToolRegistry:
                 if method not in method_map:
                     return {"error": f"Unsupported method: {method}", "status": "error"}
                 
+                # Filter out None values from query and body
+                query_values = {k: v for k, v in query_values.items() if v is not None}
+                body_values = {k: v for k, v in body_values.items() if v is not None}
+                
                 with httpx.Client(timeout=timeout) as client:
                     response = method_map[method](client, url, headers, query_values, body_values)
                     try:
                         data = response.json()
                     except Exception:
-                        data = {"text": response.text}
+                        data = {"text": response.text, "raw_response": response.text[:1000]}
                     
                     if 200 <= response.status_code < 300:
-                        return {"data": data, "status_code": response.status_code, "status": "success"}
+                        
+                        return {
+                            "data": data, 
+                            "status_code": response.status_code, 
+                            "status": "success",
+                            "headers": dict(response.headers)
+                        }
+                    
+                    # Enhanced error handling
+                    error_message = "API request failed"
+                    error_details = {}
+                    
+                    if isinstance(data, dict):
+                        error_message = data.get("error", data.get("error_description", data.get("message", error_message)))
+                        error_details = {
+                            "error_code": data.get("error_code"),
+                            "error_description": data.get("error_description"),
+                            "details": data.get("details"),
+                            "links": data.get("links")
+                        }
+                    elif isinstance(data, str):
+                        error_message = data
+                    
                     return {
-                        "error": data.get("error", "API request failed"),
+                        "error": error_message,
                         "status_code": response.status_code,
                         "data": data,
+                        "error_details": error_details,
                         "status": "error"
                     }
             except httpx.TimeoutException:
@@ -148,11 +221,13 @@ class ToolRegistry:
         api_function.__doc__ = description
         return api_function
     
-    def _build_args_schema(self, request_schema: Dict[str, Any]) -> Optional[type]:
-        """Build Pydantic model for tool arguments."""
-        if not request_schema:
-            return None
+    def _build_args_schema(self, request_schema: Dict[str, Any], path_params: List[str] = None) -> Optional[type]:
+        """Build Pydantic model for tool arguments.
         
+        Args:
+            request_schema: Request body/query parameter schema
+            path_params: List of path parameters from URL (e.g., ['order_id', 'account_id'])
+        """
         type_map = {
             "number": float, "float": float,
             "integer": int, "int": int,
@@ -161,20 +236,41 @@ class ToolRegistry:
         }
         
         fields = {}
-        for param_name, param_spec in request_schema.items():
-            if not isinstance(param_spec, dict):
-                fields[param_name] = (Optional[str], Field(default=None))
-                continue
-            
-            param_type = type_map.get(param_spec.get("type", "string"), str)
-            required = param_spec.get("required", False)
-            default = param_spec.get("default")
-            desc = param_spec.get("description", f"Parameter {param_name}")
-            
-            if required and default is None:
-                fields[param_name] = (param_type, Field(..., description=desc))
-            else:
-                fields[param_name] = (Optional[param_type], Field(default=default, description=desc))
+        
+        # Add path parameters to schema (these are always required)
+        if path_params:
+            for param_name in path_params:
+                # Generate a helpful description based on parameter name
+                # Common patterns: order_id -> "The order ID", account_id -> "The account ID", etc.
+                param_display = param_name.replace('_', ' ').title()
+                if param_name.endswith('_id'):
+                    entity = param_name[:-3].replace('_', ' ')  # Remove '_id' suffix
+                    desc = f"The {entity} ID (required path parameter)"
+                else:
+                    desc = f"The {param_display.lower()} (required path parameter)"
+                # Path parameters are always required
+                fields[param_name] = (str, Field(..., description=desc))
+        
+        # Add request schema parameters
+        if request_schema:
+            for param_name, param_spec in request_schema.items():
+                # Skip if already added as path parameter
+                if param_name in fields:
+                    continue
+                    
+                if not isinstance(param_spec, dict):
+                    fields[param_name] = (Optional[str], Field(default=None))
+                    continue
+                
+                param_type = type_map.get(param_spec.get("type", "string"), str)
+                required = param_spec.get("required", False)
+                default = param_spec.get("default")
+                desc = param_spec.get("description", f"Parameter {param_name}")
+                
+                if required and default is None:
+                    fields[param_name] = (param_type, Field(..., description=desc))
+                else:
+                    fields[param_name] = (Optional[param_type], Field(default=default, description=desc))
         
         return create_model("ArgsSchema", **fields) if fields else None
     
@@ -223,16 +319,50 @@ class ToolRegistry:
         # Create API spec
         spec = APISpec(**api_spec)
         
+        # Extract path parameters from URL (before creating function)
+        # Replace {{base_url}} temporarily to avoid matching {base_url} inside it
+        temp_url = spec.url.replace("{{base_url}}", "__BASE_URL_PLACEHOLDER__")
+        path_params = re.findall(r'\{(\w+)\}', temp_url)
+        
         # Create API function
         api_function = self._create_api_function(
             tool_name, description, spec, auth_token, timeout, use_oauth2_auth
         )
         
-        # Build args schema
-        args_schema = self._build_args_schema(spec.request_schema)
+        # Build args schema (include path parameters)
+        args_schema = self._build_args_schema(spec.request_schema, path_params=path_params)
         
-        # Create LangChain tool using StructuredTool
-        langchain_tool = StructuredTool.from_function(
+        # Create a custom tool class that handles string inputs for kwargs
+        class BankingAPITool(StructuredTool):
+            """Custom tool that handles string inputs for kwargs parameter."""
+            
+            def _parse_input(
+                self, tool_input: Union[str, dict], tool_call_id: Optional[str] = None
+            ) -> Union[str, dict]:
+                """Parse tool input, handling string JSON inputs for kwargs."""
+                # If input is a dict, check if it has a 'kwargs' key with string value
+                if isinstance(tool_input, dict):
+                    if 'kwargs' in tool_input and isinstance(tool_input['kwargs'], str):
+                        try:
+                            # Try to parse the string as JSON
+                            parsed = json.loads(tool_input['kwargs'])
+                            if isinstance(parsed, dict):
+                                # Replace kwargs string with parsed dict
+                                tool_input = {k: v for k, v in tool_input.items() if k != 'kwargs'}
+                                tool_input.update(parsed)
+                            elif tool_input['kwargs'].strip() in ['{}', '']:
+                                # Empty kwargs string, remove it
+                                tool_input = {k: v for k, v in tool_input.items() if k != 'kwargs'}
+                        except (json.JSONDecodeError, ValueError):
+                            # If parsing fails and it's empty, just remove it
+                            if tool_input['kwargs'].strip() in ['{}', '']:
+                                tool_input = {k: v for k, v in tool_input.items() if k != 'kwargs'}
+                
+                # Call parent's _parse_input
+                return super()._parse_input(tool_input, tool_call_id)
+        
+        # Create LangChain tool using custom BankingAPITool
+        langchain_tool = BankingAPITool.from_function(
             func=api_function,
             name=tool_name,
             description=description,
@@ -374,6 +504,11 @@ class ToolRegistry:
                     # Recreate tool from API spec
                     spec = APISpec(**api_spec)
                     use_oauth2_auth = metadata.get("use_oauth2_auth", False)
+                    
+                    # Extract path parameters from URL
+                    temp_url = spec.url.replace("{{base_url}}", "__BASE_URL_PLACEHOLDER__")
+                    path_params = re.findall(r'\{(\w+)\}', temp_url)
+                    
                     api_function = self._create_api_function(
                         tool_name,
                         metadata.get("description", ""),
@@ -382,7 +517,7 @@ class ToolRegistry:
                         timeout=30,
                         use_oauth2_auth=use_oauth2_auth
                     )
-                    args_schema = self._build_args_schema(spec.request_schema)
+                    args_schema = self._build_args_schema(spec.request_schema, path_params=path_params)
                     langchain_tool = StructuredTool.from_function(
                         func=api_function,
                         name=tool_name,

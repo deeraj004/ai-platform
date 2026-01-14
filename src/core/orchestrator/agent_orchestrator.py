@@ -70,14 +70,33 @@ class AgentOrchestrator:
             if final_state is None:
                 final_state = await self.graph.ainvoke(state, config)
             
+            # Ensure final_state is an AgenticState object, not a dict
+            if isinstance(final_state, dict):
+                # Convert dict to AgenticState if needed
+                try:
+                    final_state = AgenticState(**final_state)
+                except Exception as e:
+                    logger.warning(f"Could not convert final_state dict to AgenticState: {e}, using original state")
+                    final_state = state
+            
             # Calculate processing time
             processing_time = time.time() - start_time
-            final_state.processing_time = processing_time
+            if hasattr(final_state, 'processing_time'):
+                final_state.processing_time = processing_time
+            else:
+                # If it's still a dict, update it
+                if isinstance(final_state, dict):
+                    final_state['processing_time'] = processing_time
+                else:
+                    # Store in metadata as fallback
+                    if not hasattr(final_state, 'metadata'):
+                        final_state.metadata = {}
+                    final_state.metadata['processing_time'] = processing_time
             
             # Determine final status
-            if final_state.exit_early:
+            if hasattr(final_state, 'exit_early') and final_state.exit_early:
                 final_state.orchestration_status = OrchestrationStatus.EARLY_EXIT
-            elif final_state.answer and not final_state.metadata.get("evaluation", {}).get("should_retry", False):
+            elif hasattr(final_state, 'answer') and final_state.answer and not final_state.metadata.get("evaluation", {}).get("should_retry", False):
                 final_state.orchestration_status = OrchestrationStatus.COMPLETED
             else:
                 final_state.orchestration_status = OrchestrationStatus.COMPLETED
@@ -106,6 +125,7 @@ class AgentOrchestrator:
         """
         # If we have a direct answer (e.g., from early exit or execution)
         if state.answer:
+            logger.info(f"Orchestrator: Using answer from state (length: {len(state.answer)} chars)")
             return state.answer
         
         # If we have tool results, try to extract answer

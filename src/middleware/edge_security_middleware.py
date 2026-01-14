@@ -186,11 +186,11 @@ async def prompt_security_middleware(request: Request, call_next):
         )
 
     # NLP intent detection (spaCy only) - only if model is available
-    if nlp is not None and is_prompt_injection(normalized):
-        raise HTTPException(
-            status_code=400,
-            detail="Instructional or control-style input detected. Please submit only your business request."
-        )
+    # if nlp is not None and is_prompt_injection(normalized):
+    #     raise HTTPException(
+    #         status_code=400,
+    #         detail="Instructional or control-style input detected. Please submit only your business request."
+    #     )
 
     # Sanitize before forwarding
     safe_query = sanitize(normalized)

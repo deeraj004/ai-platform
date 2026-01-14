@@ -15,7 +15,7 @@ class CriticFeedback:
     logical_consistency_score: float = 0.0
     overall_quality_score: float = 0.0
     feedback_summary: str = ""
-    detailed_feedback: List[Dict[str, str]] = field(default_factory=list)
+    detailed_feedback: List[Dict[str, Any]] = field(default_factory=list)
 
 
 class OrchestrationStatus(str, Enum):

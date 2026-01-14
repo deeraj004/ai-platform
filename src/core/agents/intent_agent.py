@@ -11,6 +11,7 @@ import threading
 
 from src.core.orchestrator.state_schema import AgenticState
 from src.core.utils.observability import trace_agent
+from src.core.registry.tool_registry import tool_registry
 from settings import (
     AZURE_OPENAI_API_KEY,
     AZURE_OPENAI_API_VERSION,
@@ -66,8 +67,70 @@ class IntentClassifierAgent:
             temperature=0.3  # Lower temperature for more deterministic intent classification
         )
         
-        self.system_prompt = INTENT_CLASSIFIER_SYSTEM_PROMPT
+        self.base_system_prompt = INTENT_CLASSIFIER_SYSTEM_PROMPT
         IntentClassifierAgent._initialized = True
+    
+    def _build_system_prompt_with_domains(self) -> str:
+        """
+        Build system prompt with dynamically retrieved domains from tool registry.
+        
+        Returns:
+            System prompt string with actual registered domains
+        """
+        try:
+            # Get all registered domains from tool registry
+            registered_domains = tool_registry.list_domains()
+            
+            # Filter out system/internal domains if needed (optional)
+            # You can customize this based on your needs
+            banking_domains = [d for d in registered_domains if d not in ["system", "rag"]]
+            
+            if not banking_domains:
+                # Fallback to base prompt if no domains found
+                logger.warning("Intent Classifier: No domains found in tool registry, using base prompt")
+                return self.base_system_prompt
+            
+            # Sort domains for consistent presentation
+            banking_domains.sort()
+            
+            # Build the domain list string
+            domains_list = ", ".join(banking_domains)
+            
+            # Extract the base prompt and replace the static domain list
+            # Find where domains are mentioned in the prompt
+            prompt = self.base_system_prompt
+            
+            # Check if prompt already has a domain section
+            if "Banking domains include:" in prompt:
+                # Replace the static domain list with dynamic one
+                # Pattern to match the domain list (may span multiple lines)
+                pattern = r'Banking domains include:.*?(?=\n\n|\nOutput|$)'
+                replacement = f'Banking domains include: {domains_list}.\n\nNote: These are the currently registered domains based on available tools and APIs. Use only these domains for valid domain identification.'
+                prompt = re.sub(pattern, replacement, prompt, flags=re.DOTALL)
+            else:
+                # Add domain information if not present
+                # Find a good insertion point (after the task description)
+                if "Extract banking domains" in prompt:
+                    # Insert after the extract domains instruction
+                    insertion_point = prompt.find("Extract banking domains")
+                    if insertion_point != -1:
+                        # Find the end of that sentence
+                        end_point = prompt.find(".", insertion_point)
+                        if end_point != -1:
+                            domain_info = f"\n\nValid registered domains for identification: {domains_list}."
+                            prompt = prompt[:end_point + 1] + domain_info + prompt[end_point + 1:]
+                else:
+                    # Add at the end of guidelines if no better place found
+                    domain_section = f"\n\nValid registered domains for identification: {domains_list}."
+                    prompt = prompt + domain_section
+            
+            logger.debug(f"Intent Classifier: Built prompt with {len(banking_domains)} domains: {banking_domains[:5]}...")
+            return prompt
+            
+        except Exception as e:
+            logger.error(f"Intent Classifier: Error building dynamic prompt: {e}", exc_info=True)
+            # Fallback to base prompt on error
+            return self.base_system_prompt
     
     @trace_agent("intent_classifier")
     def process(self, state: AgenticState) -> AgenticState:
@@ -92,6 +155,9 @@ class IntentClassifierAgent:
                     for msg in recent_history
                 ])
             
+            # Build system prompt with dynamic domains from tool registry
+            system_prompt = self._build_system_prompt_with_domains()
+            
             # Create prompt
             user_prompt = f"""User Query: {state.user_query}
 
@@ -101,7 +167,7 @@ Conversation History:
 Analyze this query and provide your classification in the JSON format specified."""
             
             messages = [
-                SystemMessage(content=self.system_prompt),
+                SystemMessage(content=system_prompt),
                 HumanMessage(content=user_prompt)
             ]
             

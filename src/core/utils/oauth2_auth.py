@@ -41,7 +41,8 @@ class OAuth2AuthManager:
             self._token_expires_at: float = 0
             self._token_lock = threading.Lock()
             self._base_url = BANKING_API_BASE_URL or ""
-            self._token_url = BANKING_API_TOKEN_URL or f"{self._base_url}/v1/oauth2/token"
+            # Token URL template - will be resolved at runtime
+            self._token_url_template = BANKING_API_TOKEN_URL or "{{base_url}}/v1/oauth2/token"
             self._client_id = BANKING_API_CLIENT_ID
             self._client_secret = BANKING_API_CLIENT_SECRET
             self._initialized = True
@@ -70,12 +71,21 @@ class OAuth2AuthManager:
             logger.warning("Banking API credentials not configured. Set BANKING_API_CLIENT_ID and BANKING_API_CLIENT_SECRET in environment.")
             return None
         
-        if not self._token_url:
-            logger.warning("Token URL not configured. Set BANKING_API_TOKEN_URL in environment.")
+        # Build token URL by replacing {{base_url}} placeholder
+        token_url = self._token_url_template
+        if "{{base_url}}" in token_url:
+            if not self._base_url:
+                logger.error("BANKING_API_BASE_URL not configured. Cannot build token URL.")
+                return None
+            # Replace {{base_url}} with actual base URL (remove trailing slash if present)
+            token_url = token_url.replace("{{base_url}}", self._base_url.rstrip("/"))
+        
+        if not token_url:
+            logger.warning("Token URL not configured. Set BANKING_API_TOKEN_URL or BANKING_API_BASE_URL in environment.")
             return None
         
         try:
-            # Use Basic Auth with client_id:client_secret
+            # Use Basic Auth with client_id as username and client_secret as password
             auth = (self._client_id, self._client_secret)
             data = {"grant_type": "client_credentials"}
             headers = {
@@ -83,9 +93,11 @@ class OAuth2AuthManager:
                 "Content-Type": "application/x-www-form-urlencoded"
             }
             
+            logger.debug(f"Requesting OAuth2 token from: {token_url}")
+            
             with httpx.Client(timeout=30.0) as client:
                 response = client.post(
-                    self._token_url,
+                    token_url,
                     auth=auth,
                     data=data,
                     headers=headers
@@ -93,17 +105,39 @@ class OAuth2AuthManager:
                 
                 if response.status_code == 200:
                     token_data = response.json()
+                    
+                    # Parse access token from response
                     self._access_token = token_data.get("access_token")
-                    expires_in = token_data.get("expires_in", 3600)  # Default 1 hour
+                    if not self._access_token:
+                        logger.error("Access token not found in OAuth2 response")
+                        return None
+                    
+                    # Parse expires_in (in seconds)
+                    expires_in = token_data.get("expires_in", 3600)  # Default 1 hour if not provided
                     # Set expiry 5 minutes before actual expiry for safety
                     self._token_expires_at = time.time() + expires_in - 300
                     
-                    logger.info(f"OAuth2 access token refreshed. Expires in {expires_in}s")
+                    # Log additional token info if available
+                    token_type = token_data.get("token_type", "Bearer")
+                    scope = token_data.get("scope", "")
+                    logger.info(
+                        f"OAuth2 access token refreshed successfully. "
+                        f"Token type: {token_type}, Expires in: {expires_in}s"
+                    )
+                    if scope:
+                        logger.debug(f"Token scope: {scope[:100]}..." if len(scope) > 100 else f"Token scope: {scope}")
+                    
                     return self._access_token
                 else:
-                    logger.error(f"Failed to refresh OAuth2 token: {response.status_code} - {response.text}")
+                    error_text = response.text
+                    logger.error(
+                        f"Failed to refresh OAuth2 token: HTTP {response.status_code} - {error_text}"
+                    )
                     return None
         
+        except httpx.TimeoutException:
+            logger.error("Timeout while refreshing OAuth2 token")
+            return None
         except Exception as e:
             logger.error(f"Error refreshing OAuth2 token: {e}", exc_info=True)
             return None

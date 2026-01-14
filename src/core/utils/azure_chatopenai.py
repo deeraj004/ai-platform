@@ -23,7 +23,6 @@ from settings import (
     AZURE_OPENAI_MODEL,
     AZURE_OPENAI_AUGMENT_USER_QUERY_SYSTEM_PROMPT,
     AZURE_OPENAI_SYSTEM_PROMPT,
-    AZURE_OPENAI_DATE_MESSAGE_TEMPLATE,
     logger
 )
 
@@ -62,9 +61,11 @@ class AzureOpenAI:
         date_written = now.strftime("%B %d, %Y")
         current_date = date_written  # Use written format as current_date
         
-        # Support multiple placeholder formats in the template
+        # Default date message template
+        default_template = "Current date: {current_date} ({date_ddmmyyyy})"
+        
         try:
-            return AZURE_OPENAI_DATE_MESSAGE_TEMPLATE.format(
+            return default_template.format(
                 current_date=current_date,
                 date_ddmmyyyy=date_ddmmyyyy, 
                 date_written=date_written

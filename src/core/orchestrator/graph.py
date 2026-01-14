@@ -151,6 +151,12 @@ def create_agentic_graph() -> StateGraph:
         from src.core.utils.azure_chatopenai import azure_chatopenai
         
         try:
+            # Check if execution agent already generated an answer
+            if state.answer and state.answer.strip():
+                logger.info("Response Generator: Using answer from execution agent (already generated)")
+                logger.info(f"Response Generator: Answer length = {len(state.answer)} characters")
+                return state
+            
             logger.info("Response Generator: Generating final answer from tool results")
             
             # Extract results from tool execution

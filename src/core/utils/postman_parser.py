@@ -50,27 +50,38 @@ def extract_request_body_schema(body: Dict[str, Any]) -> Dict[str, Any]:
             logger.debug(f"Could not parse raw body as JSON: {e}")
     
     elif mode == "urlencoded" and body.get("urlencoded"):
-        # Form-encoded data
+        # Form-encoded data - only include enabled parameters
         for item in body.get("urlencoded", []):
             if not item.get("disabled", False):
                 key = item.get("key", "")
+                if not key:
+                    continue
                 desc = item.get("description", "")
+                # Check if value is provided to determine if required
+                value = item.get("value", "")
+                is_required = bool(value) and not value.startswith("{{")  # Not a variable placeholder
                 schema[key] = {
                     "type": "string",
-                    "required": not item.get("disabled", False),
-                    "description": desc or f"Parameter {key}"
+                    "required": is_required,
+                    "description": desc or f"Parameter {key}",
+                    "default": value if value and not is_required else None
                 }
     
     elif mode == "formdata" and body.get("formdata"):
-        # Form data
+        # Form data - only include enabled parameters
         for item in body.get("formdata", []):
             if not item.get("disabled", False):
                 key = item.get("key", "")
+                if not key:
+                    continue
                 desc = item.get("description", "")
+                value = item.get("value", "")
+                is_required = bool(value) and not value.startswith("{{")
                 schema[key] = {
                     "type": "string",
-                    "required": not item.get("disabled", False),
-                    "description": desc or f"Parameter {key}"
+                    "required": is_required,
+                    "description": desc or f"Parameter {key}",
+                    "default": value if value and not is_required else None
                 }
     
     return schema
@@ -131,8 +142,11 @@ def extract_query_params(url_obj: Dict[str, Any]) -> List[str]:
     if isinstance(url_obj, dict):
         if "query" in url_obj:
             for param in url_obj.get("query", []):
+                # Only include enabled parameters
                 if not param.get("disabled", False):
-                    query_params.append(param.get("key", ""))
+                    key = param.get("key", "")
+                    if key:
+                        query_params.append(key)
         elif "raw" in url_obj:
             # Parse raw URL
             raw_url = url_obj["raw"]
@@ -140,9 +154,11 @@ def extract_query_params(url_obj: Dict[str, Any]) -> List[str]:
                 query_string = raw_url.split("?")[1].split("#")[0]
                 for param in query_string.split("&"):
                     if "=" in param:
-                        query_params.append(param.split("=")[0])
+                        param_key = param.split("=")[0].strip()
+                        if param_key:
+                            query_params.append(param_key)
     
-    return query_params
+    return list(set(query_params))  # Remove duplicates
 
 
 def parse_postman_item(item: Dict[str, Any], parent_folder: str = "") -> List[Dict[str, Any]]:
@@ -219,14 +235,15 @@ def parse_postman_request(item: Dict[str, Any], folder_path: str = "") -> Option
         body = request.get("body", {})
         request_schema = extract_request_body_schema(body)
         
-        # Extract headers (excluding auth headers)
+        # Extract headers (excluding auth headers and disabled ones)
         headers = {}
         for header in request.get("header", []):
             if not header.get("disabled", False):
                 key = header.get("key", "")
                 value = header.get("value", "")
                 # Skip auth headers (will be added by auth handler)
-                if key.lower() not in ["authorization"]:
+                # Skip empty headers
+                if key and key.lower() not in ["authorization", "authorization-bearer"]:
                     headers[key] = value
         
         # Extract description
